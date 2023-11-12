@@ -179,7 +179,13 @@ starupdatetarget()
     targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -qw $LUN_NAME \
         && continue
 
-    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} false
+    for I in `seq 0 127`
+    do
+      targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns/lun${I} > /dev/null 2>&1 \
+          || break
+    done
+
+    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} $I false
   done
 
   for HOST_INFO in `cat $STAR_DIR/hostlist`
