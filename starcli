@@ -176,6 +176,8 @@ starupdatetarget()
   do
     LUN_NAME=`echo $LUN_INFO | awk '{ print $1 }'`
 
+    grep -qw $LUN_NAME $STAR_DIR/hostlist || continue
+
     targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -qw $LUN_NAME \
         && continue
 
@@ -186,6 +188,8 @@ starupdatetarget()
     done
 
     targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} $I false
+    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN create $I \
+        /backstores/block/STAR-${LUN_NAME}
   done
 
   for HOST_INFO in `cat $STAR_DIR/hostlist`
