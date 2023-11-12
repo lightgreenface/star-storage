@@ -13,6 +13,7 @@ AVAILABLE_COMMAND+=("starattachlun host_name lun_name1[,lun_name2 ...]")
 AVAILABLE_COMMAND+=("stardetachlun host_name lun_name1[,lun_name2 ...] [-nop]")
 AVAILABLE_COMMAND+=("starlistlun")
 AVAILABLE_COMMAND+=("starlisthost")
+AVAILABLE_COMMAND+=("starshowpool")
 AVAILABLE_COMMAND+=("shootingstar   # Run 'pcs resource move' command.")
 AVAILABLE_COMMAND+=("stargazing     # Run 'pcs status' command.")
 AVAILABLE_COMMAND+=("starupdatetarget")
@@ -435,6 +436,10 @@ case $COMMAND_NAME in
     ;;
   starlisthost)
     cat $STAR_DIR/hostlist
+    ;;
+  starshowpool)
+    check_active_node
+    vgdisplay
     ;;
   shootingstar)
     check_active_node
