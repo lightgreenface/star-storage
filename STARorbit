@@ -1,0 +1,143 @@
+#!/bin/bash
+# chkconfig: 345 99 1
+# description: STAR iSCSI target control script
+
+NODE_NAME=`uname -n`
+NODE_BASENAME=${NODE_NAME/%?/}
+NODE_NUM=${NODE_NAME: -1}
+
+if [ $NODE_NUM -eq 1 ];
+then
+  PARTNER_NODE="${NODE_BASENAME}2"
+else
+  PARTNER_NODE="${NODE_BASENAME}1"
+fi
+
+STANDBY_NON_OPTIMIZED=0
+
+test -f /etc/star/config && . /etc/star/config
+
+start_as_active()
+{
+  iscsiadm -m node --logout
+
+  cat /etc/target/saveconfig.json.active > /etc/target/saveconfig.json
+
+  systemctl restart target
+
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/etc/init.d/STARorbit start" &
+}
+
+start_as_standby()
+{
+  for I in `seq 120`
+  do
+    IS_ACTIVE_NODE=`vgs --noheadings | wc -l`
+
+    if [ $IS_ACTIVE_NODE -gt 0 ];
+    then
+      break
+    fi
+       # This function may run for a long time (up to 10 minutes);
+       # it has the possibility of switching to ACTIVE in parallel,
+       # checking ACTIVE, if it detects then exiting.
+    
+    iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
+    iscsiadm -m node --login
+    
+    sleep 5
+    
+    AVAILABLE_DISKS=`ls /dev/disk/by-id/scsi-SLIO-ORG* | wc -l`
+
+    if [ $AVAILABLE_DISKS -gt 0 ];
+    then
+      cat /etc/target/saveconfig.json.standby > /etc/target/saveconfig.json
+
+      systemctl start target
+
+      if [ $STANDBY_NON_OPTIMIZED -eq 1 ]
+      then
+        for BKST in `targetcli ls /backstores/block 1 | grep scsi-SLIO-ORG | awk '{ print $2 }'`
+        do
+          targetcli /backstores/block/$BKST/alua/default_tg_pt_gp \
+              set alua alua_access_state=1 alua_support_active_optimized=0
+        done
+      fi
+
+      break
+    fi
+  done
+}
+
+stop_as_active()
+{
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/etc/init.d/STARorbit stop"
+
+  systemctl stop target
+}
+
+stop_as_standby()
+{
+  systemctl stop target
+}
+
+start()
+{
+  echo -n "Starting STAR iSCSI target:"
+
+  IS_ACTIVE_NODE=`vgs --noheadings | wc -l`
+
+  if [ $IS_ACTIVE_NODE -gt 0 ];
+  then
+    start_as_active
+  else
+    start_as_standby
+  fi
+
+  return 0
+}
+
+stop()
+{
+  echo -n "Stopping STAR iSCSI target:"
+
+  systemctl is-active target || return 0
+
+  IS_ACTIVE_NODE=`vgs --noheadings | wc -l`
+
+  if [ $IS_ACTIVE_NODE -gt 0 ];
+  then
+    stop_as_active
+  else
+    stop_as_standby
+  fi
+
+  return 0
+}
+
+status()
+{
+  IS_ACTIVE_NODE=`vgs --noheadings | wc -l`
+
+  if [ $IS_ACTIVE_NODE -gt 0 ];
+  then
+    systemctl status target
+    return $?
+  fi
+
+  return 3
+     # STANDBY node always returns 'stopped'
+     # to prevent detection of 2-nodes-active by Pacemaker.
+}
+
+case $1 in
+  start)
+    start
+      ;;
+  stop)
+     stop
+      ;;
+  status)
+     status
+      ;;
+esac
