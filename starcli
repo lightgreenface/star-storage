@@ -1,0 +1,452 @@
+#!/bin/bash
+
+CLI_VERSION="0.1"
+
+STAR_DIR="/etc/star"
+
+AVAILABLE_COMMAND=()
+AVAILABLE_COMMAND+=("starcreatelun lun_name lun_size")
+AVAILABLE_COMMAND+=("stardeletelun lun_name [-nop]   # Specify '-nop', does not ask yes/no.")
+AVAILABLE_COMMAND+=("starcreatehost host_name host_iqn [lun_name1,lun_name2 ...]")
+AVAILABLE_COMMAND+=("stardeletehost host_name [-nop]")
+AVAILABLE_COMMAND+=("starattachlun host_name lun_name1[,lun_name2 ...]")
+AVAILABLE_COMMAND+=("stardetachlun host_name lun_name1[,lun_name2 ...] [-nop]")
+AVAILABLE_COMMAND+=("starlistlun")
+AVAILABLE_COMMAND+=("starlisthost")
+AVAILABLE_COMMAND+=("shootingstar   # Run 'pcs resource move' command.")
+AVAILABLE_COMMAND+=("stargazing     # Run 'pcs status' command.")
+AVAILABLE_COMMAND+=("starupdatetarget")
+
+POOL_NAME=${POOL_NAME:-STARpool}
+
+NODE_NAME=`uname -n`
+NODE_BASENAME=${NODE_NAME/%?/}
+NODE_NUM=${NODE_NAME: -1}
+
+if [ $NODE_NUM -eq 1 ];
+then
+  PARTNER_NODE="${NODE_BASENAME}2"
+else
+  PARTNER_NODE="${NODE_BASENAME}1"
+fi
+
+is_active_node()
+{
+  AVAILABLE_VGS=`vgs --noheadings | wc -l`
+
+  if [ $AVAILABLE_VGS -gt 0 ]
+  then
+    return 0
+  else
+    return 1
+  fi
+}
+
+check_active_node()
+{
+  is_active_node && return 0
+
+  echo "This command must be run on active controller."
+  exit 1
+}
+
+starcli()
+{
+  echo "starcli version $CLI_VERSION"
+  echo
+  echo 'Available Commands:'
+
+  for I in $(seq 0 $(( ${#AVAILABLE_COMMAND[@]} - 1 )))
+  do
+    LINK_NAME=`echo ${AVAILABLE_COMMAND[$I]} | awk '{ print $1 }'`
+    ( cd /usr/bin ; test -L $LINK_NAME || ln -s starcli $LINK_NAME )
+
+    echo "  ${AVAILABLE_COMMAND[$I]}"
+  done
+}
+
+starcreatelun()
+{
+  LUN_NAME=$1
+  LUN_SIZE=$2
+
+  check_active_node
+
+  grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
+      && { echo "$LUN_NAME is already exists." ; exit 1 ; }
+
+  echo "$LUN_NAME" | grep -qE '^LUN[0-9]+$' \
+      || { echo "lun_name must be match pettern '^LUN[0-9]+'." ; exit 1 ; }
+  
+  echo "$LUN_SIZE" | grep -qE '^[0-9]+M$' \
+      || { echo "lun_size must be in megabytes, like '1024M'." ; exit 1 ; }
+
+  LUN_WWN=`uuidgen`
+
+  lvcreate -n $LUN_NAME -L $LUN_SIZE $POOL_NAME \
+      || { echo "Failed to create ${LUN_NAME}." ; exit 1 ; }
+
+  echo "$LUN_NAME $LUN_WWN $LUN_SIZE" >> $STAR_DIR/lunlist
+
+  scp $STAR_DIR/lunlist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "$LUN_NAME $LUN_WWN $LUN_SIZE"
+}
+
+stardeletelun()
+{
+  LUN_NAME=$1
+  NOP=$2
+
+  if [ "x-nop" = "x$NOP" ]
+  then
+    OPT="-y"
+  fi
+
+  check_active_node
+
+  grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
+      || { echo "$LUN_NAME is not exists." ; exit 1 ; }
+
+  grep -qw "$LUN_NAME" $STAR_DIR/hostlist \
+      && { echo "Cannot delete $LUN_NAME, the lun belongs to hosts." ; exit 1 ; }
+
+  lvremove $OPT /dev/$POOL_NAME/$LUN_NAME \
+      || { echo "Failed to delete ${LUN_NAME}." ; exit 1 ; }
+
+  grep -vw "$LUN_NAME" $STAR_DIR/lunlist > $STAR_DIR/lunlist.$$
+  mv $STAR_DIR/lunlist.$$ $STAR_DIR/lunlist
+
+  scp $STAR_DIR/lunlist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "$LUN_NAME deleted."
+}
+
+starupdatetarget()
+{
+  ##
+  ## add objects
+  ##
+  OLD_IFS=$IFS
+  IFS=$'\n'
+  for LUN_INFO in `cat $STAR_DIR/lunlist`
+  do
+    LUN_NAME=`echo $LUN_INFO | awk '{ print $1 }'`
+    LUN_WWN=`echo $LUN_INFO | awk '{ print $2 }'`
+
+    targetcli ls /backstores/block/STAR-${LUN_NAME} > /dev/null 2>&1 \
+        && continue
+ 
+    DEV="/dev/STARpool/$LUN_NAME"
+    is_active_node || DEV="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}_${LUN_WWN}"
+
+    is_active_node
+    if [ $? -ne 0 ]
+    then
+      iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
+      iscsiadm -m node --login
+
+      for SCSI_HOST in `ls -1d /sys/class/scsi_host/host*`
+      do
+        echo '- - -' > $SCSI_HOST/scan
+      done
+      sleep 5
+    fi
+
+    targetcli /backstores/block create name=STAR-${LUN_NAME} \
+        dev=${DEV} wwn=${LUN_WWN}
+  done
+  IFS=$OLD_IFS
+
+  ARRAY_NAME=`cat $STAR_DIR/starname`
+  ARRAY_TGT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-target"
+
+  targetcli ls /iscsi/$ARRAY_TGT_IQN > /dev/null 2>&1 \
+      || targetcli /iscsi create $ARRAY_TGT_IQN
+
+  ARRAY_INIT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-initiator"
+
+  targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN > /dev/null 2>&1 \
+      || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $ARRAY_INIT_IQN
+
+  OLD_IFS=$IFS
+  IFS=$'\n'
+  for LUN_INFO in `cat $STAR_DIR/lunlist`
+  do
+    LUN_NAME=`echo $LUN_INFO | awk '{ print $1 }'`
+
+    targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -qw $LUN_NAME \
+        && continue
+
+    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} false
+  done
+
+  for HOST_INFO in `cat $STAR_DIR/hostlist`
+  do
+    HOST_IQN=`echo $HOST_INFO | awk '{ print $2 }'`
+    HOST_LUNS=`echo $HOST_INFO | awk '{ print $3 }'`
+
+    targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN > /dev/null 2>&1 \
+        || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $HOST_IQN false
+
+    for LUN_NAME in `echo $HOST_LUNS | sed 's/,/\n/g'`
+    do
+      targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN | grep -qw $LUN_NAME \
+          && continue
+
+      for I in `seq 0 127`
+      do
+        targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN/mapped_lun${I} > /dev/null 2>&1 \
+            || break
+      done
+
+      targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN create $I \
+          /backstores/block/STAR-${LUN_NAME}
+    done
+  done
+  IFS=$OLD_IFS
+
+  ##
+  ## remove objects
+  ##
+  for HOST_IQN in \
+      `targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls 1 | grep -v -e acls -e $ARRAY_INIT_IQN | awk '{ print $2 }'`
+  do
+    grep -q "[[:blank:]]${HOST_IQN}[[:blank:]]" $STAR_DIR/hostlist \
+        || { targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls delete $HOST_IQN ; continue ; }
+
+    for LUN_NAME in $(targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN \
+        | grep mapped_lun | awk -F- '{ print $3 }' | awk '{ print $1 }')
+    do
+      INDEX=$(targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN \
+          | grep $LUN_NAME | awk '{ print $2 }' | sed 's/mapped_lun//g')
+
+      grep "[[:blank:]]${HOST_IQN}[[:blank:]]" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
+          || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN delete $INDEX
+    done
+  done
+
+  for LUN_NAME in $(targetcli ls /backstores/block | grep STAR- | awk '{ print $2 }' \
+      | awk -F- '{ print $2 }')
+  do
+    grep -wq $LUN_NAME $STAR_DIR/hostlist \
+        || targetcli /backstores/block delete STAR-$LUN_NAME
+  done
+
+  ##
+  ## save and send config to partner node
+  ##
+  targetcli saveconfig
+
+  CONF_NAME="/etc/target/saveconfig.json.active"
+  is_active_node || CONF_NAME="/etc/target/saveconfig.json.standby"
+
+  scp $CONF_NAME ${PARTNER_NODE}:/etc/target
+}
+
+starcreatehost()
+{
+  HOST_NAME=$1
+  HOST_IQN=$2
+  HOST_LUNS=$3
+
+  check_active_node
+
+  grep -qw "$HOST_NAME" $STAR_DIR/hostlist \
+      && { echo "$HOST_NAME is already exists." ; exit 1 ; }  
+
+  grep -qw "$HOST_IQN" $STAR_DIR/hostlist \
+      && { echo "$HOST_IQN is already exists." ; exit 1 ; }  
+
+  echo "$HOST_NAME $HOST_IQN $HOST_LUNS" >> $STAR_DIR/hostlist
+
+  starupdatetarget
+
+  scp $STAR_DIR/hostlist ${PARTNER_NODE}:$STAR_DIR
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+
+  echo "$HOST_NAME created."  
+}
+
+stardeletehost()
+{
+  HOST_NAME=$1
+  NOP=$2
+
+  check_active_node
+
+  grep -qw "$HOST_NAME" $STAR_DIR/hostlist \
+      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+
+  if [ "x-nop" = "x$NOP" ]
+  then
+    :
+  else
+    echo -n "Delete host ${HOST_NAME}? [y/N]:"
+    read YN
+    
+    case $YN in
+      [yY]*)
+        :
+        ;;
+      *)
+        echo 'Operation canceled.'
+        exit 1
+        ;;
+    esac
+  fi
+
+  grep -vw "$HOST_NAME" $STAR_DIR/hostlist > $STAR_DIR/hostlist.$$
+  mv $STAR_DIR/hostlist.$$ $STAR_DIR/hostlist
+
+  starupdatetarget
+
+  scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+
+  echo "$HOST_NAME deleted."
+}
+
+starattachlun()
+{
+  HOST_NAME=$1
+  ATTACH_LUNS=$2
+
+  check_active_node
+
+  grep -qw "$HOST_NAME" $STAR_DIR/hostlist \
+      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+
+  for LUN_NAME in `echo $ATTACH_LUNS | sed 's/,/\n/g'`
+  do
+    grep -w "$HOST_NAME" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
+        && { echo "$LUN_NAME is already belongs to ${HOST_NAME}." ; exit 1 ; }
+  done
+
+  HOST_INFO=`grep -w $HOST_NAME $STAR_DIR/hostlist`
+  HOST_IQN=`echo $HOST_INFO | awk '{ print $2 }'`
+  HOST_LUNS=`echo $HOST_INFO | awk '{ print $3 }'`
+
+  if [ -z "$HOST_LUNS" ]
+  then
+    HOST_LUNS="$ATTACH_LUNS"
+  else
+    HOST_LUNS=$(echo "${HOST_LUNS},${ATTACH_LUNS}" \
+        | sed 's/,/\n/g' | sort | tr '\n' ',' | sed 's/,$/\n/g')
+  fi
+
+  cat $STAR_DIR/hostlist \
+      | sed 's/'"${HOST_NAME}"' .*/'"${HOST_NAME} ${HOST_IQN} ${HOST_LUNS}"'/g' \
+          > $STAR_DIR/hostlist.$$
+  mv $STAR_DIR/hostlist.$$ $STAR_DIR/hostlist
+
+  starupdatetarget
+
+  scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+
+  echo "${ATTACH_LUNS} atached to ${HOST_NAME}." 
+}
+
+stardetachlun()
+{
+  HOST_NAME=$1
+  DETACH_LUNS=$2
+  NOP=$3
+
+  check_active_node
+
+  grep -qw "$HOST_NAME" $STAR_DIR/hostlist \
+      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+
+  for LUN_NAME in `echo $DETACH_LUNS | sed 's/,/\n/g'`
+  do
+    grep -w "$HOST_NAME" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
+        || { echo "$LUN_NAME is not belongs to ${HOST_NAME}." ; exit 1 ; }
+  done
+
+  if [ "x-nop" = "x$NOP" ]
+  then
+    :
+  else
+    echo -n "Detach ${DETACH_LUNS} from ${HOST_NAME}? [y/N]:"
+    read YN
+
+    case $YN in
+      [yY]*)
+        :
+        ;;
+      *)
+        echo 'Operation canceled.'
+        exit 1
+        ;;
+    esac
+  fi
+
+  HOST_INFO=`grep -w $HOST_NAME $STAR_DIR/hostlist`
+  HOST_IQN=`echo $HOST_INFO | awk '{ print $2 }'`
+  HOST_LUNS=`echo $HOST_INFO | awk '{ print $3 }'`
+
+  for LUN_NAME in `echo $DETACH_LUNS | sed 's/,/\n/g'`
+  do
+    HOST_LUNS=$(echo "${HOST_LUNS}" | sed 's/,/\n/g' | grep -vw $LUN_NAME \
+        | sort | tr '\n' ',' | sed 's/,$/\n/g')
+  done
+
+  cat $STAR_DIR/hostlist \
+      | sed 's/'"${HOST_NAME}"' .*/'"${HOST_NAME} ${HOST_IQN} ${HOST_LUNS}"'/g' \
+          > $STAR_DIR/hostlist.$$
+  mv $STAR_DIR/hostlist.$$ $STAR_DIR/hostlist
+
+  starupdatetarget
+
+  scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+
+  echo "$DETACH_LUNS detached from ${HOST_NAME}."
+}
+
+COMMAND_NAME=`basename $0`
+
+case $COMMAND_NAME in
+  starcli)
+    starcli "$@"
+    ;;
+  starcreatelun)
+    starcreatelun "$@"
+    ;;
+  stardeletelun)
+    stardeletelun "$@"
+    ;;
+  starcreatehost)
+    starcreatehost "$@"
+    ;;
+  stardeletehost)
+    stardeletehost "$@"
+    ;;
+  starattachlun)
+    starattachlun "$@"
+    ;;
+  stardetachlun)
+    stardetachlun "$@"
+    ;;
+  starlistlun)
+    cat $STAR_DIR/lunlist
+    ;;
+  starlisthost)
+    cat $STAR_DIR/hostlist
+    ;;
+  shootingstar)
+    check_active_node
+    pcs resource move STARpool --autodelete
+    ;;
+  stargazing)
+    pcs status
+    ;;
+  starupdatetarget)
+    starupdatetarget "$@"
+    ;;
+  *)
+    echo 'This command is not implemented yet.'
+    ;;
+esac
