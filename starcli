@@ -249,10 +249,18 @@ starupdatetarget()
   ##
   targetcli saveconfig
 
-  CONF_NAME="/etc/target/saveconfig.json.active"
-  is_active_node || CONF_NAME="/etc/target/saveconfig.json.standby"
+  RUNNING_CONFIG="/etc/target/saveconfig.json"
 
-  scp $CONF_NAME ${PARTNER_NODE}:/etc/target
+  if is_active_node
+  then
+    STARTUP_CONFIG="${RUNNING_CONFIG}.active"
+  else
+    STARTUP_CONFIG="${RUNNING_CONFIG}.standby"
+  fi
+
+  cp -p $RUNNING_CONFIG $STARTUP_CONFIG
+
+  scp $STARTUP_CONFIG ${PARTNER_NODE}:/etc/target
 }
 
 starcreatehost()
