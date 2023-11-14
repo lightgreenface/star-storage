@@ -112,6 +112,13 @@ stardeletelun()
   grep -qw "$LUN_NAME" $STAR_DIR/hostlist \
       && { echo "Cannot delete $LUN_NAME, the lun belongs to hosts." ; exit 1 ; }
 
+  NUM_LUNS=`cat $STAR_DIR/lunlist | wc -l`
+  if [ $NUM_LUNS -eq 1 ]
+  then
+    echo "Cannot delete $LUN_NAME, there must be at least 1 existing lun."
+    exit 1
+  fi
+
   lvremove $OPT /dev/$POOL_NAME/$LUN_NAME \
       || { echo "Failed to delete ${LUN_NAME}." ; exit 1 ; }
 
@@ -137,13 +144,20 @@ starupdatetarget()
 
     targetcli ls /backstores/block/STAR-${LUN_NAME} > /dev/null 2>&1 \
         && continue
- 
-    DEV="/dev/STARpool/$LUN_NAME"
-    is_active_node || DEV="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}_${LUN_WWN}"
 
-    is_active_node
-    if [ $? -ne 0 ]
+    if is_active_node
     then
+      DEV="/dev/STARpool/$LUN_NAME"
+    else
+      DEV="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}_${LUN_WWN}"
+      DEV_WITHOUT_WWN="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}"
+
+      for OLD_DEV in `ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null | grep -Fv ${DEV}`
+      do
+        echo 1 > /sys/block/$(basename $(readlink $OLD_DEV))/device/delete \
+            && test -L $OLD_DEV && sleep 5
+      done
+
       iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
       iscsiadm -m node --login
 
