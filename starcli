@@ -1,6 +1,11 @@
 #!/bin/bash
 
-CLI_VERSION="0.1"
+if [ $UID -ne 0 ]
+then
+  exec sudo $0 "$@"
+fi
+
+CLI_VERSION="0.2"
 
 STAR_DIR="/etc/star"
 
@@ -17,6 +22,7 @@ AVAILABLE_COMMAND+=("starshowpool")
 AVAILABLE_COMMAND+=("shootingstar   # Run 'pcs resource move' command.")
 AVAILABLE_COMMAND+=("stargazing     # Run 'pcs status' command.")
 AVAILABLE_COMMAND+=("starupdatetarget")
+AVAILABLE_COMMAND+=("stargetactive")
 
 POOL_NAME=${POOL_NAME:-STARpool}
 
@@ -439,6 +445,16 @@ stardetachlun()
   echo "$DETACH_LUNS detached from ${HOST_NAME}."
 }
 
+stargetactive()
+{
+  if is_active_node
+  then
+    echo $NODE_NAME
+  else
+    echo $PARTNER_NODE
+  fi
+}
+
 COMMAND_NAME=`basename $0`
 
 case $COMMAND_NAME in
@@ -482,6 +498,9 @@ case $COMMAND_NAME in
     ;;
   starupdatetarget)
     starupdatetarget "$@"
+    ;;
+  stargetactive)
+    stargetactive "$@"
     ;;
   *)
     echo 'This command is not implemented yet.'
