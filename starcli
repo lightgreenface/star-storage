@@ -118,10 +118,10 @@ stardeletelun()
   grep -qw "$LUN_NAME" $STAR_DIR/hostlist \
       && { echo "Cannot delete $LUN_NAME, the lun belongs to hosts." ; exit 1 ; }
 
-  NUM_LUNS=`cat $STAR_DIR/lunlist | wc -l`
-  if [ $NUM_LUNS -eq 1 ]
+  NUM_LVS=`lvs --noheadings | wc -l`
+  if [ $NUM_LVS -eq 1 ]
   then
-    echo "Cannot delete $LUN_NAME, there must be at least 1 existing lun."
+    echo "Cannot delete $LUN_NAME, there must be at least 1 existing LV."
     exit 1
   fi
 
