@@ -6,121 +6,81 @@ NODE_BASENAME="$(uname -n | sed 's/\(.\+\).$/\1/g')"
 NODE_NUM="$(uname -n | sed 's/.\+\(.\)$/\1/g')"
 PARTNER_NODE="${NODE_BASENAME}$(( 3 - $NODE_NUM ))"
 
-STANDBY_NON_OPTIMIZED=0
-
 test -f /etc/star/config && . /etc/star/config
 
-is_active_node()
-{
-  vgs --noheadings | grep -q .
-  return $?
-}
+is_active_node() { pcs resource status STARpool | egrep -q "Started $(uname -n)" ; }
 
-start_as_active()
-{
+start_as_active() {
   iscsiadm -m node --logout
 
-  cat /etc/target/saveconfig.json.active > /etc/target/saveconfig.json
+  cp /etc/target/{saveconfig.json.active,saveconfig.json}
   systemctl restart target
 
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/etc/init.d/STARorbit start" &
 }
 
-start_as_standby()
-{
-  for I in `seq 120`
-  do
+start_as_standby() {
+  for I in $(seq 120); do
     is_active_node && break
-       # This function may run for a long time (up to 10 minutes);
-       # it has the possibility of switching to ACTIVE in parallel,
-       # checking ACTIVE, if it detects then exiting.
-    
+       # This function may run for up to 10 minutes, with the possibility of
+       # parallel switching to ACTIVE. If it detects ACTIVE, it exits.
+
+    pcs resource status STARorbit | egrep -q "Started ${PARTNER_NODE}" || \
+       { sleep 5 ; continue ; }
+
     iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
     iscsiadm -m node --login
-    
-    sleep 5
-    
-    AVAILABLE_DISKS=`ls /dev/disk/by-id/scsi-SLIO-ORG* | wc -l`
-    if [ $AVAILABLE_DISKS -gt 0 ]
-    then
-      cat /etc/target/saveconfig.json.standby > /etc/target/saveconfig.json
-      systemctl start target
 
-      if [ $STANDBY_NON_OPTIMIZED -eq 1 ]
-      then
-        for BKST in `targetcli ls /backstores/block 1 | grep scsi-SLIO-ORG | awk '{ print $2 }'`
-        do
-          targetcli /backstores/block/$BKST/alua/default_tg_pt_gp \
-              set alua alua_access_state=1 alua_support_active_optimized=0
-        done
-      fi
-      break
-    fi
+    for SCSI_HOST in $(ls -1d /sys/class/scsi_host/host*) ; do
+      echo '- - -' > $SCSI_HOST/scan ; done
+
+    sleep 5 ; ls /dev/disk/by-id/scsi-SLIO-ORG* || continue
+
+    cp /etc/target/{saveconfig.json.standby,saveconfig.json}
+    systemctl start target
+
+    if [ ${STANDBY_NON_OPTIMIZED:-0} -eq 1 ]; then
+      for BKST in $(targetcli ls /backstores/block 1 | awk '/STAR/{ print $2 }'); do
+        targetcli /backstores/block/$BKST/alua/default_tg_pt_gp \
+            set alua alua_access_state=1 alua_support_active_optimized=0 ; done ; fi
+    break
   done
 }
 
-stop_as_active()
-{
+stop_as_active() {
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/etc/init.d/STARorbit stop"
   systemctl stop target
 }
 
-stop_as_standby()
-{
-  systemctl stop target
-}
+stop_as_standby() { systemctl stop target ; }
 
-start()
-{
+start() {
   echo -n "Starting STAR iSCSI target:"
 
-  if is_active_node
-  then
-    start_as_active
-  else
-    start_as_standby
-  fi
+  is_active_node && start_as_active
+  is_active_node || start_as_standby
 
   return 0
 }
 
-stop()
-{
+stop() {
   echo -n "Stopping STAR iSCSI target:"
 
   systemctl is-active target || return 0
-
-  if is_active_node
-  then
-    stop_as_active
-  else
-    stop_as_standby
-  fi
+  is_active_node && stop_as_active
+  is_active_node || stop_as_standby
 
   return 0
 }
 
-status()
-{
-  if is_active_node
-  then
-    systemctl status target
-    return $?
-  fi
-
-  return 3
-     # STANDBY node always returns 'stopped'
-     # to prevent detection of 2-nodes-active by Pacemaker.
+status() {
+  is_active_node || return 3
+     # STANDBY returns 'stopped' to avoid 2-nodes-active detection by Pacemaker.
+  systemctl status target
 }
 
 case $1 in
-  start)
-    start
-      ;;
-  stop)
-     stop
-      ;;
-  status)
-     status
-      ;;
+  start)  start  ;;
+  stop)   stop   ;;
+  status) status ;;
 esac
