@@ -8,12 +8,15 @@ PARTNER_NODE="${NODE_BASENAME}$(( 3 - $NODE_NUM ))"
 
 test -f /etc/star/config && . /etc/star/config
 
-is_active_node() { pcs resource status STARpool | egrep -q "Started $(uname -n)" ; }
+is_active_node() { pcs resource status STARpool | egrep -q "Started +$(uname -n)"; }
 
 start_as_active() {
   iscsiadm -m node --logout
 
   cp /etc/target/{saveconfig.json.active,saveconfig.json}
+  sed -i -e "s/node._tg_pt_gp/node${NODE_NUM}_tg_pt_gp/g" \
+      -e "s/\"tg_pt_gp_id\": [12]/\"tg_pt_gp_id\": ${NODE_NUM}/g" \
+          /etc/target/saveconfig.json
   systemctl restart target
 
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/etc/init.d/STARorbit start" &
@@ -25,7 +28,7 @@ start_as_standby() {
        # This function may run for up to 10 minutes, with the possibility of
        # parallel switching to ACTIVE. If it detects ACTIVE, it exits.
 
-    pcs resource status STARorbit | egrep -q "Started ${PARTNER_NODE}" || \
+    pcs resource status STARorbit | egrep -q "Started +${PARTNER_NODE}" || \
        { sleep 5 ; continue ; }
 
     iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
@@ -37,12 +40,17 @@ start_as_standby() {
     sleep 5 ; ls /dev/disk/by-id/scsi-SLIO-ORG* >/dev/null 2>&1 || continue
 
     cp /etc/target/{saveconfig.json.standby,saveconfig.json}
+    sed -i -e "s/node._tg_pt_gp/node${NODE_NUM}_tg_pt_gp/g" \
+        -e "s/\"tg_pt_gp_id\": [12]/\"tg_pt_gp_id\": ${NODE_NUM}/g" \
+            /etc/target/saveconfig.json
+    if test jq >/dev/null 2>&1; then
+      jq '(.storage_objects[].alua_tpgs[] | select(.name | test("node._tg_pt_gp")) 
+          | .alua_access_type) |=1' | jq "(.storage_objects[].alua_tpgs[]
+              | select(.name | test(\"node._tg_pt_gp\"))
+                  | .alua_access_state) |=${STANDBY_NON_OPTIMIZED:-0}" \
+                      /etc/target/saveconfig.json > /etc/target/saveconfig.json.$$ \
+                          && mv /etc/target/{saveconfig.json.$$,saveconfig.json}; fi
     systemctl start target
-
-    if [ ${STANDBY_NON_OPTIMIZED:-0} -eq 1 ]; then
-      for BKST in $(targetcli ls /backstores/block 1 | awk '/STAR/{ print $2 }'); do
-        targetcli /backstores/block/$BKST/alua/default_tg_pt_gp \
-            set alua alua_access_state=1 alua_support_active_optimized=0 ; done ; fi
     break
   done
 }
