@@ -270,9 +270,9 @@ starupdatetarget()
     targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} $I false
     targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN create $I \
         /backstores/block/STAR-${LUN_NAME}
-    set_alua_tgt_port_grp
-
     targetcli_ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns > /dev/null 2>&1
+
+    set_alua_tgt_port_grp
   done
 
   for HOST_INFO in $(cat $STAR_DIR/hostlist)
