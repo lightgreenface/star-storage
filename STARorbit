@@ -43,7 +43,7 @@ start_as_standby() {
     sed -i -e "s/node._tg_pt_gp/node${NODE_NUM}_tg_pt_gp/g" \
         -e "s/\"tg_pt_gp_id\": [12]/\"tg_pt_gp_id\": ${NODE_NUM}/g" \
             /etc/target/saveconfig.json
-    if test jq >/dev/null 2>&1; then
+    if type jq >/dev/null 2>&1; then
       jq '(.storage_objects[].alua_tpgs[] | select(.name | test("node._tg_pt_gp")) 
           | .alua_access_type) |=1' | jq "(.storage_objects[].alua_tpgs[]
               | select(.name | test(\"node._tg_pt_gp\"))
