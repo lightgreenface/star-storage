@@ -44,12 +44,12 @@ start_as_standby() {
         -e "s/\"tg_pt_gp_id\": [12]/\"tg_pt_gp_id\": ${NODE_NUM}/g" \
             /etc/target/saveconfig.json
     if type jq >/dev/null 2>&1; then
-      jq '(.storage_objects[].alua_tpgs[] | select(.name | test("node._tg_pt_gp")) 
-          | .alua_access_type) |=1' | jq "(.storage_objects[].alua_tpgs[]
-              | select(.name | test(\"node._tg_pt_gp\"))
-                  | .alua_access_state) |=${STANDBY_NON_OPTIMIZED:-0}" \
-                      /etc/target/saveconfig.json > /etc/target/saveconfig.json.$$ \
-                          && mv /etc/target/{saveconfig.json.$$,saveconfig.json}; fi
+      jq '(.storage_objects[].alua_tpgs[] | select(.name | test("node._tg_pt_gp"))
+          | .alua_access_type) |=1' /etc/target/saveconfig.json \
+          | jq "(.storage_objects[].alua_tpgs[]
+              | select(.name | test(\"node._tg_pt_gp\")) | .alua_access_state) \
+                  |=${STANDBY_NON_OPTIMIZED:-0}" > /etc/target/saveconfig.json.$$ \
+                      && mv /etc/target/{saveconfig.json.$$,saveconfig.json}; fi
     systemctl start target
     break
   done
