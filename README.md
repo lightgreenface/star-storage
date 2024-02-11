@@ -11,4 +11,5 @@ DO NOT store important data, this implementation is not intended for practical u
 * [Building traditional data storage in the cloud](https://zenn.dev/lightgreenface/articles/0b0188ffdc30fd)
 * [Deployment on Google Cloud](https://zenn.dev/lightgreenface/articles/b9c4bc74bc9eb2)
 * [Deployment on Amazon Web Services](https://zenn.dev/lightgreenface/articles/753e4271b4c3d8)
+* [Deployment on VirtualBox](https://zenn.dev/lightgreenface/articles/4643f25df18946)
 * [CLI installation and Practices](https://zenn.dev/lightgreenface/articles/0da59c1233fac0)
