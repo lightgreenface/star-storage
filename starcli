@@ -82,13 +82,16 @@ starcli()
   echo
   echo 'Available Commands:'
 
-  for I in $(seq 0 $(( ${#AVAILABLE_COMMAND[@]} - 1 )))
-  do
-    LINK_NAME=$(echo ${AVAILABLE_COMMAND[$I]} | awk '{ print $1 }')
-    ( cd /usr/bin ; test -L $LINK_NAME || ln -s starcli $LINK_NAME )
+  (
+    cd /usr/bin
+    for I in $(seq 0 $(( ${#AVAILABLE_COMMAND[@]} - 1 )))
+    do
+      LINK_NAME=${AVAILABLE_COMMAND[$I]%% *}
+      test -L $LINK_NAME || ln -s starcli $LINK_NAME
 
-    echo "  ${AVAILABLE_COMMAND[$I]}"
-  done
+      echo "  ${AVAILABLE_COMMAND[$I]}"
+    done
+  )
 }
 
 starcreatelun()
