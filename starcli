@@ -25,7 +25,7 @@ AVAILABLE_COMMAND+=("stargazing            # Run 'pcs status' command.")
 AVAILABLE_COMMAND+=("starupdatetarget      # Update iSCSI target according to definitions.")
 AVAILABLE_COMMAND+=("stargetactive         # Return active controller name.")
 AVAILABLE_COMMAND+=("starshowconfig")
-AVAILABLE_COMMAND+=("starsetconfig variable1=value1[,variable2=value2 ...]")
+AVAILABLE_COMMAND+=("starsetconfig variable1=value1[,variable2=value2 ...] [-nop]")
 AVAILABLE_COMMAND+=("bigbang [-force] [-nop]   # Delete all hosts and luns. DO NOT USE unless necessary.")
 
 POOL_NAME=${POOL_NAME:-STARpool}
@@ -558,9 +558,12 @@ stargetactive()
 starsetconfig()
 {
   VAR_VAL_LIST=$1
+  NOP=$2
 
   check_active_node
   check_all_nodes_online
+
+  confirm_execution "Set $VAR_VAL_LIST to config?" $NOP
 
   for VAR_VAL in $(echo $VAR_VAL_LIST | sed 's/,/\n/g')
   do
