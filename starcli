@@ -5,7 +5,7 @@ then
   exec sudo $0 "$@"
 fi
 
-CLI_VERSION="0.5"
+CLI_VERSION="0.6"
 
 STAR_DIR="/etc/star"
 ARRAY_VERSION=$(cat $STAR_DIR/version)
@@ -20,12 +20,13 @@ AVAILABLE_COMMAND+=("stardetachlun host_name lun_name1[,lun_name2 ...] [-nop]")
 AVAILABLE_COMMAND+=("starlistlun")
 AVAILABLE_COMMAND+=("starlisthost")
 AVAILABLE_COMMAND+=("starshowpool")
-AVAILABLE_COMMAND+=("shootingstar       # Run 'pcs resource move' command.")
-AVAILABLE_COMMAND+=("stargazing         # Run 'pcs status' command.")
-AVAILABLE_COMMAND+=("starupdatetarget   # Update iSCSI target according to definitions.")
-AVAILABLE_COMMAND+=("stargetactive      # Return active controller name.")
+AVAILABLE_COMMAND+=("shootingstar [-nop]   # Run 'pcs resource move' command.")
+AVAILABLE_COMMAND+=("stargazing            # Run 'pcs status' command.")
+AVAILABLE_COMMAND+=("starupdatetarget      # Update iSCSI target according to definitions.")
+AVAILABLE_COMMAND+=("stargetactive         # Return active controller name.")
 AVAILABLE_COMMAND+=("starshowconfig")
 AVAILABLE_COMMAND+=("starsetconfig variable1=value1[,variable2=value2 ...]")
+AVAILABLE_COMMAND+=("bigbang [-force] [-nop]   # Delete all hosts and luns. DO NOT USE unless necessary.")
 
 POOL_NAME=${POOL_NAME:-STARpool}
 
@@ -54,6 +55,30 @@ check_all_nodes_online()
 
   echo "There are offline nodes."
   exit 1
+}
+
+confirm_execution()
+{
+  MSG=$1
+  NOP=$2
+
+  if [ "x-nop" = "x$NOP" ]
+  then
+    :
+  else
+    echo -n "$MSG [y/N]:"
+    read YN
+
+    case $YN in
+      [yY]*)
+        :
+        ;;
+      *)
+        echo 'Operation canceled.'
+        exit 1
+        ;;
+    esac
+  fi
 }
 
 targetcli_ls()
@@ -128,10 +153,7 @@ stardeletelun()
   LUN_NAME=$1
   NOP=$2
 
-  if [ "x-nop" = "x$NOP" ]
-  then
-    OPT="-y"
-  fi
+  [ "x-nop" = "x$NOP" ] && OPT="-y"
 
   check_active_node
   check_all_nodes_online
@@ -423,23 +445,7 @@ stardeletehost()
   grep -qw "^$HOST_NAME" $STAR_DIR/hostlist \
       || { echo "$HOST_NAME is not exists." ; exit 1 ; }
 
-  if [ "x-nop" = "x$NOP" ]
-  then
-    :
-  else
-    echo -n "Delete host ${HOST_NAME}? [y/N]:"
-    read YN
-    
-    case $YN in
-      [yY]*)
-        :
-        ;;
-      *)
-        echo 'Operation canceled.'
-        exit 1
-        ;;
-    esac
-  fi
+  confirm_execution "Delete host ${HOST_NAME}?" $NOP
 
   grep -vw "^$HOST_NAME" $STAR_DIR/hostlist > $STAR_DIR/hostlist.$$
   mv $STAR_DIR/hostlist.$$ $STAR_DIR/hostlist
@@ -514,23 +520,7 @@ stardetachlun()
         || { echo "$LUN_NAME is not belongs to ${HOST_NAME}." ; exit 1 ; }
   done
 
-  if [ "x-nop" = "x$NOP" ]
-  then
-    :
-  else
-    echo -n "Detach ${DETACH_LUNS} from ${HOST_NAME}? [y/N]:"
-    read YN
-
-    case $YN in
-      [yY]*)
-        :
-        ;;
-      *)
-        echo 'Operation canceled.'
-        exit 1
-        ;;
-    esac
-  fi
+  confirm_execution "Detach ${DETACH_LUNS} from ${HOST_NAME}?" $NOP
 
   HOST_INFO=$(grep -w ^$HOST_NAME $STAR_DIR/hostlist)
   HOST_IQN=$(echo $HOST_INFO | awk '{ print $2 }')
@@ -586,6 +576,30 @@ starsetconfig()
   echo 'For apply in most cases, need to failover with `shootingstar` command.'
 }
 
+bigbang()
+{
+  FORCE=$1
+  NOP=$2
+
+  check_active_node
+  check_all_nodes_online
+
+  [ "x-force" = "x$FORCE" ] || { echo "MUST specify '-force'." ; exit 1 ; }
+  confirm_execution "Delete all hosts and luns?" $NOP
+
+  : > $STAR_DIR/hostlist
+  starupdatetarget
+
+  scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+
+  lvremove -y /dev/STARpool/LUN*
+  : > $STAR_DIR/lunlist
+  scp $STAR_DIR/lunlist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "Hosts and luns are deleted."
+}
+
 COMMAND_NAME=$(basename $0)
 
 case $COMMAND_NAME in
@@ -602,6 +616,7 @@ case $COMMAND_NAME in
   shootingstar)
     check_active_node
     check_all_nodes_online
+    confirm_execution "Execute shootingstar? (means node failover)" $1
     pcs resource move STARpool --autodelete
     ;;
   stargazing)
