@@ -5,10 +5,11 @@ then
   exec sudo $0 "$@"
 fi
 
-CLI_VERSION="0.6"
+CLI_VERSION="0.7"
 
 STAR_DIR="/etc/star"
 ARRAY_VERSION=$(cat $STAR_DIR/version)
+test -f /etc/star/config && . /etc/star/config
 
 AVAILABLE_COMMAND=()
 AVAILABLE_COMMAND+=("starcreatelun lun_name lun_size")
@@ -35,9 +36,25 @@ NODE_BASENAME=${NODE_NAME/%?/}
 NODE_NUM=${NODE_NAME: -1}
 PARTNER_NODE="${NODE_BASENAME}$(( 3 - $NODE_NUM ))"
 
+if [ ${STARCLI_DEBUG:-0} -ge 1 ]
+then
+  CMD_STDOUT="/proc/self/fd/1"
+else
+  CMD_STDOUT="/dev/null"
+fi
+
+version() { echo "$@" | awk -F. '{ printf("%03d%03d%03d\n",$1,$2,$3); }' ; }
+
 is_active_node()
 {
-  pcs resource status STARpool | egrep -q "Started +$(uname -n)"
+  if [ -v IS_AVTIVE_NODE_RET ]
+  then
+    :
+  else
+    pcs resource status STARpool | egrep -q "Started +$(uname -n)"
+    IS_AVTIVE_NODE_RET=$?
+  fi
+  return $IS_AVTIVE_NODE_RET
 }
 
 check_active_node()
@@ -182,41 +199,11 @@ stardeletelun()
   echo "$LUN_NAME deleted."
 }
 
-version() { echo "$@" | awk -F. '{ printf("%03d%03d%03d\n",$1,$2,$3); }' ; }
-
-create_tgt_port_grp()
-{
-  if [ $(version "$ARRAY_VERSION") -ge $(version "0.4") ]
-  then
-    targetcli ls /backstores/block/STAR-${LUN_NAME}/alua \
-        | grep -q 'node._tg_pt_gp' || {
-          targetcli /backstores/block/STAR-${LUN_NAME}/alua create \
-              node${NODE_NUM}_tg_pt_gp ${NODE_NUM}
-          if ! is_active_node
-          then
-            test -f /etc/star/config && . /etc/star/config
-            targetcli /backstores/block/STAR-${LUN_NAME}/alua/node${NODE_NUM}_tg_pt_gp \
-                set alua alua_access_type=1 alua_access_state=${STANDBY_NON_OPTIMIZED:-0}
-          fi ; }
-  fi
-}
-
-set_alua_tgt_port_grp()
-{
-  if [ $(version "$ARRAY_VERSION") -ge $(version "0.4") ]
-  then
-    targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -w STAR-${LUN_NAME} \
-        | grep -q 'node._tg_pt_gp' || {
-          lunN=$(targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns \
-              | awk "/STAR-${LUN_NAME}/{ print \$2 }")
-          targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns/$lunN \
-              set alua alua_tg_pt_gp_name=node${NODE_NUM}_tg_pt_gp ; }
-  fi
-}
-
 starupdatetarget()
 {
   WORKDIR=$(mktemp -d --tmpdir ${COMMAND_NAME}.XXXXXX)
+
+  echo "Updating iSCSI target configs on $NODE_NAME, takes a while."
 
   ##
   ## create temp lunlist
@@ -230,6 +217,7 @@ starupdatetarget()
   ##
   ## add objects
   ##
+  SEND_TGT=0
   OLD_IFS=$IFS
   IFS=$'\n'
   for LUN_INFO in $(cat $WORKDIR/lunlist)
@@ -239,8 +227,7 @@ starupdatetarget()
 
     [ "$LUN_NAME" = "HD140283" ] || { grep -qw $LUN_NAME $STAR_DIR/hostlist || continue ; }
 
-    targetcli_ls -c /backstores/block 1 | grep -wq STAR-${LUN_NAME} \
-        && { create_tgt_port_grp ; continue ; }
+    targetcli_ls -c /backstores/block 1 | grep -wq STAR-${LUN_NAME} && continue
 
     if is_active_node
     then
@@ -248,36 +235,69 @@ starupdatetarget()
     else
       DEV="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}_${LUN_WWN}"
 
-      iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
-      iscsiadm -m node --login
+      if [ $SEND_TGT -eq 0 ]
+      then
+        iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE >$CMD_STDOUT
+        iscsiadm -m node --login
+        SEND_TGT=1
+      fi
 
-      for SCSI_HOST in $(ls -1d /sys/class/scsi_host/host*)
+      for SCSI_HOST in $(iscsiadm -m host -P 1 | awk '/Host Number:/{ print $3 }')
       do
-        echo '- - -' > $SCSI_HOST/scan
+        echo '- - -' > /sys/class/scsi_host/host${SCSI_HOST}/scan
       done
 
       for I in $(seq 1 5)
       do
-        test -L ${DEV} || { sleep 1 ; continue ; }
+        test -L ${DEV} || {
+            sleep 1 ; echo "Waiting for the device to appear. [$I]" >&2 ; continue ; }
 	break
       done
     fi
 
-    test -L ${DEV} && targetcli /backstores/block create name=STAR-${LUN_NAME} \
-        dev=${DEV} wwn=${LUN_WWN} && create_tgt_port_grp
+    test -L ${DEV} && {
+        echo cd /backstores/block
+        echo create name=STAR-${LUN_NAME} dev=${DEV} wwn=${LUN_WWN} ; } \
+           >> $WORKDIR/create_bs_lun_cmds
   done
+
+  [ -s $WORKDIR/create_bs_lun_cmds ] && {
+      cat $WORKDIR/create_bs_lun_cmds | targetcli >$CMD_STDOUT ; }
+
+  if [ $(version "$ARRAY_VERSION") -ge $(version "0.4") ]
+  then 
+    targetcli_ls /backstores/block 1 > /dev/null 2>&1
+    for LUN_INFO in $(cat $WORKDIR/lunlist)
+    do
+      LUN_NAME=$(echo $LUN_INFO | awk '{ print $1 }')
+
+      targetcli_ls -c /backstores/block 1 | grep -wq STAR-${LUN_NAME} || continue
+
+      targetcli ls /backstores/block/STAR-${LUN_NAME}/alua \
+          | grep -q 'node._tg_pt_gp' || { echo cd /backstores/block/STAR-${LUN_NAME}/alua
+              echo create node${NODE_NUM}_tg_pt_gp ${NODE_NUM}
+            if ! is_active_node
+            then
+              echo cd /backstores/block/STAR-${LUN_NAME}/alua/node${NODE_NUM}_tg_pt_gp
+              echo set alua alua_access_type=1 alua_access_state=${STANDBY_NON_OPTIMIZED:-0}
+            fi ; }
+    done > $WORKDIR/create_tgt_port_grp_cmds
+  fi
   IFS=$OLD_IFS
+
+  [ -s $WORKDIR/create_tgt_port_grp_cmds ] && {
+      cat $WORKDIR/create_tgt_port_grp_cmds | targetcli >$CMD_STDOUT ; }
 
   ARRAY_NAME=$(cat $STAR_DIR/starname)
   ARRAY_TGT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-target"
 
   targetcli ls /iscsi/$ARRAY_TGT_IQN > /dev/null 2>&1 \
-      || targetcli /iscsi create $ARRAY_TGT_IQN
+      || targetcli /iscsi create $ARRAY_TGT_IQN >$CMD_STDOUT
 
   ARRAY_INIT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-initiator"
 
   targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN > /dev/null 2>&1 \
-      || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $ARRAY_INIT_IQN
+      || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $ARRAY_INIT_IQN >$CMD_STDOUT
 
   OLD_IFS=$IFS
   IFS=$'\n'
@@ -287,8 +307,7 @@ starupdatetarget()
 
     [ "$LUN_NAME" = "HD140283" ] || { grep -qw $LUN_NAME $STAR_DIR/hostlist || continue ; }
 
-    targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -qw $LUN_NAME \
-        && { set_alua_tgt_port_grp ; continue ; }
+    targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -qw $LUN_NAME && continue
 
     if [ "$LUN_NAME" = "HD140283" ]
     then
@@ -296,18 +315,37 @@ starupdatetarget()
     else
       for I in $(seq 0 127)
       do
-        targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -wq lun${I} \
-            || break
+        targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -wq lun${I} || break
       done
     fi
 
-    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} $I false
-    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN create $I \
-        /backstores/block/STAR-${LUN_NAME}
+    targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/luns create /backstores/block/STAR-${LUN_NAME} $I false \
+        >$CMD_STDOUT
     targetcli_ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns > /dev/null 2>&1
 
-    set_alua_tgt_port_grp
+    { echo cd /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN
+      echo create $I /backstores/block/STAR-${LUN_NAME} ; } >> $WORKDIR/create_map_lun_array_cmds
   done
+
+  [ -s $WORKDIR/create_map_lun_array_cmds ] && {
+      cat $WORKDIR/create_map_lun_array_cmds | targetcli >$CMD_STDOUT ; }
+
+  if [ $(version "$ARRAY_VERSION") -ge $(version "0.4") ]
+  then
+    for LUN_INFO in $(cat $WORKDIR/lunlist)
+    do
+      LUN_NAME=$(echo $LUN_INFO | awk '{ print $1 }')
+      targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -w STAR-${LUN_NAME} \
+          | grep -q 'node._tg_pt_gp' || {
+            lunN=$(targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns \
+                | awk "/STAR-${LUN_NAME}/{ print \$2 }")
+            echo cd /iscsi/$ARRAY_TGT_IQN/tpg1/luns/$lunN
+            echo set alua alua_tg_pt_gp_name=node${NODE_NUM}_tg_pt_gp ; }
+    done > $WORKDIR/set_alua_tgt_port_grp_cmds
+  fi
+
+  [ -s $WORKDIR/set_alua_tgt_port_grp_cmds ] && {
+      cat $WORKDIR/set_alua_tgt_port_grp_cmds | targetcli >$CMD_STDOUT ; }
 
   for HOST_INFO in $(cat $STAR_DIR/hostlist)
   do
@@ -315,7 +353,8 @@ starupdatetarget()
     HOST_LUNS=$(echo $HOST_INFO | awk '{ print $3 }')
 
     targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/acls | grep -qw $HOST_IQN \
-        || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $HOST_IQN false
+        || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $HOST_IQN false \
+	    >$CMD_STDOUT
 
     for LUN_NAME in $(echo $HOST_LUNS | sed 's/,/\n/g')
     do
@@ -329,7 +368,7 @@ starupdatetarget()
       done
 
       targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN create $I \
-          /backstores/block/STAR-${LUN_NAME}
+          /backstores/block/STAR-${LUN_NAME} >$CMD_STDOUT
 
       targetcli_ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN > /dev/null 2>&1
     done
@@ -344,7 +383,7 @@ starupdatetarget()
           | awk '{ print $2 }')
   do
     grep -q "[[:blank:]]${HOST_IQN}[[:blank:]]" $STAR_DIR/hostlist \
-        || { targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls delete $HOST_IQN ; continue ; }
+        || { targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls delete $HOST_IQN >$CMD_STDOUT ; continue ; }
 
     for LUN_NAME in $(targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN \
         | grep mapped_lun | awk -F- '{ print $3 }' | awk '{ print $1 }')
@@ -353,7 +392,7 @@ starupdatetarget()
           | grep $LUN_NAME | awk '{ print $2 }' | sed 's/mapped_lun//g')
 
       grep "[[:blank:]]${HOST_IQN}[[:blank:]]" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
-          || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN delete $INDEX
+          || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN delete $INDEX >$CMD_STDOUT
     done
   done
 
@@ -362,25 +401,34 @@ starupdatetarget()
   do
     if ! grep -wq $LUN_NAME $STAR_DIR/hostlist
     then
-      targetcli /backstores/block delete STAR-$LUN_NAME
-
-      if ! is_active_node
-      then
-        DEV_WITHOUT_WWN="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}"
-
-        for DEV in $(ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null)
-        do
-          echo 1 > /sys/block/$(basename $(readlink $DEV))/device/delete
-        done
-
-        for I in $(seq 1 5)
-        do
-          ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null && { sleep 1 ; continue ; }
-          break
-        done
-      fi
+      echo cd /backstores/block
+      echo delete STAR-$LUN_NAME
     fi
-  done
+  done > $WORKDIR/delete_bs_lun_cmds
+
+  [ -s $WORKDIR/delete_bs_lun_cmds ] && {
+      cat $WORKDIR/delete_bs_lun_cmds | targetcli >$CMD_STDOUT ; }
+
+  if ! is_active_node
+  then
+    for LUN_NAME in $(cat $WORKDIR/delete_bs_lun_cmds | awk '/STAR-/{ print $2 }')
+    do
+      DEV_WITHOUT_WWN="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}"
+
+      for DEV in $(ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null)
+      do
+        echo 1 > /sys/block/$(basename $(readlink $DEV))/device/delete
+      done
+
+      for I in $(seq 1 5)
+      do
+        ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null && {
+            sleep 1 ; echo "Waiting for the device to disappear. [$I]" >&2 ;
+                continue ; }
+        break
+      done
+    done
+  fi
 
   ##
   ## save and send config to partner node
@@ -429,7 +477,8 @@ starcreatehost()
   starupdatetarget
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:$STAR_DIR
-  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
 
   echo "$HOST_NAME created."  
 }
@@ -453,7 +502,8 @@ stardeletehost()
   starupdatetarget
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
-  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
 
   echo "$HOST_NAME deleted."
 }
@@ -497,7 +547,8 @@ starattachlun()
   starupdatetarget
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
-  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
 
   echo "${ATTACH_LUNS} atached to ${HOST_NAME}." 
 }
@@ -540,7 +591,8 @@ stardetachlun()
   starupdatetarget
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
-  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
 
   echo "$DETACH_LUNS detached from ${HOST_NAME}."
 }
@@ -594,7 +646,8 @@ bigbang()
   starupdatetarget
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
-  ssh -n -o ConnectTimeout=10 $PARTNER_NODE "/usr/bin/starupdatetarget"
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
 
   lvremove -y /dev/STARpool/LUN*
   : > $STAR_DIR/lunlist
