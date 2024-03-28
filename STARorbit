@@ -34,10 +34,10 @@ start_as_standby() {
     iscsiadm -m discovery -t sendtargets -p $PARTNER_NODE
     iscsiadm -m node --login
 
-    for SCSI_HOST in $(ls -1d /sys/class/scsi_host/host*) ; do
-      echo '- - -' > $SCSI_HOST/scan ; done
+    for ISCSI_HOST in $(ls -1 /sys/class/iscsi_host) ; do
+      echo '- - -' > /sys/class/scsi_host/$ISCSI_HOST/scan ; done
 
-    sleep 5 ; ls /dev/disk/by-id/scsi-SLIO-ORG* >/dev/null 2>&1 || continue
+    sleep 5 ; lsscsi | fgrep -q -e STAR-LUN -e STAR-HD140283 || continue
 
     cp /etc/target/{saveconfig.json.standby,saveconfig.json}
     sed -i -e "s/node._tg_pt_gp/node${NODE_NUM}_tg_pt_gp/g" \
