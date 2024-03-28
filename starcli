@@ -5,9 +5,10 @@ then
   exec sudo $0 "$@"
 fi
 
-CLI_VERSION="0.7"
+CLI_VERSION="0.8"
 
 STAR_DIR="/etc/star"
+ARRAY_NAME=$(cat $STAR_DIR/starname)
 ARRAY_VERSION=$(cat $STAR_DIR/version)
 test -f /etc/star/config && . /etc/star/config
 
@@ -21,12 +22,15 @@ AVAILABLE_COMMAND+=("stardetachlun host_name lun_name1[,lun_name2 ...] [-nop]")
 AVAILABLE_COMMAND+=("starlistlun")
 AVAILABLE_COMMAND+=("starlisthost")
 AVAILABLE_COMMAND+=("starshowpool")
-AVAILABLE_COMMAND+=("shootingstar [-nop]   # Run 'pcs resource move' command.")
-AVAILABLE_COMMAND+=("stargazing            # Run 'pcs status' command.")
-AVAILABLE_COMMAND+=("starupdatetarget      # Update iSCSI target according to definitions.")
-AVAILABLE_COMMAND+=("stargetactive         # Return active controller name.")
+AVAILABLE_COMMAND+=("shootingstar [-nop]             # Run 'pcs resource move' command.")
+AVAILABLE_COMMAND+=("stargazing                      # Run 'pcs status' command.")
+AVAILABLE_COMMAND+=("starupdatetarget [-withclear]   # Update iSCSI target according to definitions.")
+AVAILABLE_COMMAND+=("stargetactive                   # Return active controller name.")
 AVAILABLE_COMMAND+=("starshowconfig")
 AVAILABLE_COMMAND+=("starsetconfig variable1=value1[,variable2=value2 ...] [-nop]")
+AVAILABLE_COMMAND+=("galaxyrebootnode [-nop]")
+AVAILABLE_COMMAND+=("galaxyshutdownnode [-nop]")
+AVAILABLE_COMMAND+=("galaxyshutdownarray [-nop]")
 AVAILABLE_COMMAND+=("bigbang [-force] [-nop]   # Delete all hosts and luns. DO NOT USE unless necessary.")
 
 POOL_NAME=${POOL_NAME:-STARpool}
@@ -201,16 +205,23 @@ stardeletelun()
 
 starupdatetarget()
 {
+  WITHCLEAR=$1
+
   WORKDIR=$(mktemp -d --tmpdir ${COMMAND_NAME}.XXXXXX)
 
   echo "Updating iSCSI target configs on $NODE_NAME, takes a while."
+
+  ##
+  ## executes targetcli clear config before updating
+  ##
+  [ "x-withclear" = "x$WITHCLEAR" ] && targetcli clearconfig confirm=True
 
   ##
   ## create temp lunlist
   ##
   if [ $(version "$ARRAY_VERSION") -ge $(version "0.3") ]
   then
-    echo HD140283 54686520-6f6c-6465-7374-20737461722e > $WORKDIR/lunlist
+    is_active_node && echo HD140283 54686520-6f6c-6465-7374-20737461722e > $WORKDIR/lunlist
   fi
   cat $STAR_DIR/lunlist >> $WORKDIR/lunlist
 
@@ -233,7 +244,8 @@ starupdatetarget()
     then
       DEV="/dev/STARpool/$LUN_NAME"
     else
-      DEV="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}_${LUN_WWN}"
+      DEV="/dev/disk/by-id/scsi-36001405$(echo ${LUN_WWN//-/} | cut -c 1-25)"
+         # 001405 is IEEE Company ID of OpenFablics.
 
       if [ $SEND_TGT -eq 0 ]
       then
@@ -242,9 +254,9 @@ starupdatetarget()
         SEND_TGT=1
       fi
 
-      for SCSI_HOST in $(iscsiadm -m host -P 1 | awk '/Host Number:/{ print $3 }')
+      for ISCSI_HOST in $(ls -1 /sys/class/iscsi_host)
       do
-        echo '- - -' > /sys/class/scsi_host/host${SCSI_HOST}/scan
+        echo '- - -' > /sys/class/scsi_host/$ISCSI_HOST/scan
       done
 
       for I in $(seq 1 5)
@@ -288,7 +300,6 @@ starupdatetarget()
   [ -s $WORKDIR/create_tgt_port_grp_cmds ] && {
       cat $WORKDIR/create_tgt_port_grp_cmds | targetcli >$CMD_STDOUT ; }
 
-  ARRAY_NAME=$(cat $STAR_DIR/starname)
   ARRAY_TGT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-target"
 
   targetcli ls /iscsi/$ARRAY_TGT_IQN > /dev/null 2>&1 \
@@ -296,8 +307,11 @@ starupdatetarget()
 
   ARRAY_INIT_IQN="iqn.2023-09.test.use.only:${ARRAY_NAME}-initiator"
 
-  targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN > /dev/null 2>&1 \
-      || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $ARRAY_INIT_IQN >$CMD_STDOUT
+  if is_active_node
+  then
+    targetcli ls /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN > /dev/null 2>&1 \
+        || targetcli /iscsi/$ARRAY_TGT_IQN/tpg1/acls create $ARRAY_INIT_IQN >$CMD_STDOUT
+  fi
 
   OLD_IFS=$IFS
   IFS=$'\n'
@@ -323,8 +337,11 @@ starupdatetarget()
         >$CMD_STDOUT
     targetcli_ls /iscsi/$ARRAY_TGT_IQN/tpg1/luns > /dev/null 2>&1
 
-    { echo cd /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN
-      echo create $I /backstores/block/STAR-${LUN_NAME} ; } >> $WORKDIR/create_map_lun_array_cmds
+    if is_active_node
+    then
+      { echo cd /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$ARRAY_INIT_IQN
+        echo create $I /backstores/block/STAR-${LUN_NAME} ; } >> $WORKDIR/create_map_lun_array_cmds
+    fi
   done
 
   [ -s $WORKDIR/create_map_lun_array_cmds ] && {
@@ -413,16 +430,16 @@ starupdatetarget()
   then
     for LUN_NAME in $(cat $WORKDIR/delete_bs_lun_cmds | awk '/STAR-/{ print $2 }')
     do
-      DEV_WITHOUT_WWN="/dev/disk/by-id/scsi-SLIO-ORG_STAR-${LUN_NAME}"
+      LUN_WWN=$(grep -w ${LUN_NAME/STAR-/} $STAR_DIR/lunlist | awk '{ print $2 }')
+      DEV="/dev/disk/by-id/scsi-36001405$(echo ${LUN_WWN//-/} | cut -c 1-25)"
 
-      for DEV in $(ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null)
-      do
-        echo 1 > /sys/block/$(basename $(readlink $DEV))/device/delete
-      done
+      test -L ${DEV} || continue
+
+      echo 1 > /sys/block/$(basename $(readlink $DEV))/device/delete
 
       for I in $(seq 1 5)
       do
-        ls -1d ${DEV_WITHOUT_WWN}_* 2> /dev/null && {
+        ls -1d ${DEV} 2> /dev/null && {
             sleep 1 ; echo "Waiting for the device to disappear. [$I]" >&2 ;
                 continue ; }
         break
@@ -680,6 +697,23 @@ case $COMMAND_NAME in
     ;;
   starshowconfig)
     cat $STAR_DIR/config
+    ;;
+  galaxyrebootnode)
+    confirm_execution "Reboot node ${NODE_NAME}?" $1
+    reboot
+    ;;
+  galaxyshutdownnode)
+    confirm_execution "Shutdown node ${NODE_NAME}?" $1
+    shutdown -h now
+    ;;
+  galaxyshutdownarray)
+    check_active_node
+    check_all_nodes_online
+    confirm_execution "Shutdown array ${ARRAY_NAME}?" $1
+    ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+        "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/galaxyshutdownnode -nop"
+    sleep 30
+    galaxyshutdownnode -nop
     ;;
   *)
     $COMMAND_NAME "$@"
