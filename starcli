@@ -1,11 +1,35 @@
 #!/bin/bash
 
+if [ ${STARCLI_TRACE:=0} -eq 1 ]
+then
+  set -x
+else
+  set +x
+fi
+
+if [ ${STARCLI_DEBUG:=0} -ge 1 ]
+then
+  CMD_STDOUT="/proc/self/fd/1"
+else
+  CMD_STDOUT="/dev/null"
+fi
+
+AVAILABLE_ENVIRONMENT=()
+AVAILABLE_ENVIRONMENT+=("STARCLI_DEBUG")
+AVAILABLE_ENVIRONMENT+=("STARCLI_TRACE")
+
+for I in $(seq 0 $(( ${#AVAILABLE_ENVIRONMENT[@]} - 1 )))
+do
+  ENV_VAL="${AVAILABLE_ENVIRONMENT[$I]}=$(eval echo \${${AVAILABLE_ENVIRONMENT[$I]}})"
+  EXP_CMDLINE_FOR_SSH="$EXP_CMDLINE_FOR_SSH export $ENV_VAL;"
+done
+
 if [ $UID -ne 0 ]
 then
   exec sudo $0 "$@"
 fi
 
-CLI_VERSION="0.8"
+CLI_VERSION="0.9"
 
 STAR_DIR="/etc/star"
 ARRAY_NAME=$(cat $STAR_DIR/starname)
@@ -13,17 +37,28 @@ ARRAY_VERSION=$(cat $STAR_DIR/version)
 test -f /etc/star/config && . /etc/star/config
 
 AVAILABLE_COMMAND=()
+AVAILABLE_COMMAND+=("starcli")
+AVAILABLE_COMMAND+=("starclienv")
+AVAILABLE_COMMAND+=("starlistlun")
+AVAILABLE_COMMAND+=("starshowlun lun_or_snap_name1[,lun_or_snap_name2 ...]")
 AVAILABLE_COMMAND+=("starcreatelun lun_name lun_size")
 AVAILABLE_COMMAND+=("stardeletelun lun_name [-nop]   # Specify '-nop', does not ask yes/no.")
-AVAILABLE_COMMAND+=("starcreatehost host_name host_iqn [lun_name1,lun_name2 ...]")
-AVAILABLE_COMMAND+=("stardeletehost host_name [-nop]")
-AVAILABLE_COMMAND+=("starattachlun host_name lun_name1[,lun_name2 ...]")
-AVAILABLE_COMMAND+=("stardetachlun host_name lun_name1[,lun_name2 ...] [-nop]")
-AVAILABLE_COMMAND+=("starlistlun")
 AVAILABLE_COMMAND+=("starlisthost")
+AVAILABLE_COMMAND+=("starcreatehost host_name host_iqn [lun_or_snap_name1,lun_or_snap_name2 ...]")
+AVAILABLE_COMMAND+=("stardeletehost host_name [-nop]")
+AVAILABLE_COMMAND+=("starattachlun host_name lun_or_snap_name1[,lun_or_snap_name2 ...]")
+AVAILABLE_COMMAND+=("stardetachlun host_name lun_or_snap_name1[,lun_or_snap_name2 ...] [-nop]")
+AVAILABLE_COMMAND+=("starlistsnap")
+AVAILABLE_COMMAND+=("starcreatesnap snap_name src_lun_name snap_size")
+AVAILABLE_COMMAND+=("starrecreatesnap snap_name [-nop]")
+AVAILABLE_COMMAND+=("starextendsnap snap_name snap_size [-nop]")
+AVAILABLE_COMMAND+=("starrestoresnap snap_name [-nop]")
+AVAILABLE_COMMAND+=("stardeletesnap snap_name [-nop]")
+AVAILABLE_COMMAND+=("staractivatelun lun_or_snap_name1[,lun_or_snap_name2 ...]")
+AVAILABLE_COMMAND+=("stardeactivatelun lun_or_snap_name1[,lun_or_snap_name2 ...] [-nop]")
 AVAILABLE_COMMAND+=("starshowpool")
-AVAILABLE_COMMAND+=("shootingstar [-nop]             # Run 'pcs resource move' command.")
 AVAILABLE_COMMAND+=("stargazing                      # Run 'pcs status' command.")
+AVAILABLE_COMMAND+=("shootingstar [-nop]             # Run 'pcs resource move' command.")
 AVAILABLE_COMMAND+=("starupdatetarget [-withclear]   # Update iSCSI target according to definitions.")
 AVAILABLE_COMMAND+=("stargetactive                   # Return active controller name.")
 AVAILABLE_COMMAND+=("starshowconfig")
@@ -31,7 +66,7 @@ AVAILABLE_COMMAND+=("starsetconfig variable1=value1[,variable2=value2 ...] [-nop
 AVAILABLE_COMMAND+=("galaxyrebootnode [-nop]")
 AVAILABLE_COMMAND+=("galaxyshutdownnode [-nop]")
 AVAILABLE_COMMAND+=("galaxyshutdownarray [-nop]")
-AVAILABLE_COMMAND+=("bigbang [-force] [-nop]   # Delete all hosts and luns. DO NOT USE unless necessary.")
+AVAILABLE_COMMAND+=("bigbang -force [-nop]   # Delete all hosts and luns. DO NOT USE unless necessary.")
 
 POOL_NAME=${POOL_NAME:-STARpool}
 
@@ -39,13 +74,6 @@ NODE_NAME=$(uname -n)
 NODE_BASENAME=${NODE_NAME/%?/}
 NODE_NUM=${NODE_NAME: -1}
 PARTNER_NODE="${NODE_BASENAME}$(( 3 - $NODE_NUM ))"
-
-if [ ${STARCLI_DEBUG:-0} -ge 1 ]
-then
-  CMD_STDOUT="/proc/self/fd/1"
-else
-  CMD_STDOUT="/dev/null"
-fi
 
 version() { echo "$@" | awk -F. '{ printf("%03d%03d%03d\n",$1,$2,$3); }' ; }
 
@@ -124,6 +152,7 @@ targetcli_ls()
 
 starcli()
 {
+  echo
   echo "starcli version $CLI_VERSION"
   echo
   echo 'Available Commands:'
@@ -133,11 +162,28 @@ starcli()
     for I in $(seq 0 $(( ${#AVAILABLE_COMMAND[@]} - 1 )))
     do
       LINK_NAME=${AVAILABLE_COMMAND[$I]%% *}
-      test -L $LINK_NAME || ln -s starcli $LINK_NAME
+      if [ "$LINK_NAME" != "starcli" ]
+      then
+        test -L $LINK_NAME || ln -s starcli $LINK_NAME
+      fi
 
       echo "  ${AVAILABLE_COMMAND[$I]}"
     done
   )
+  echo
+}
+
+starclienv()
+{
+  echo
+  echo 'Available Environments:'
+
+  for I in $(seq 0 $(( ${#AVAILABLE_ENVIRONMENT[@]} - 1 )))
+  do
+    ENV_VAL="${AVAILABLE_ENVIRONMENT[$I]}=$(eval echo \${${AVAILABLE_ENVIRONMENT[$I]}})"
+    echo "  ${ENV_VAL}"
+  done
+  echo
 }
 
 starcreatelun()
@@ -149,7 +195,7 @@ starcreatelun()
   check_all_nodes_online
 
   grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
-      && { echo "$LUN_NAME is already exists." ; exit 1 ; }
+      && { echo "$LUN_NAME already exists." ; exit 1 ; }
 
   echo "$LUN_NAME" | grep -qE '^LUN[0-9]+$' \
       || { echo "lun_name must be match pettern '^LUN[0-9]+'." ; exit 1 ; }
@@ -174,16 +220,17 @@ stardeletelun()
   LUN_NAME=$1
   NOP=$2
 
-  [ "x-nop" = "x$NOP" ] && OPT="-y"
-
   check_active_node
   check_all_nodes_online
 
   grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
-      || { echo "$LUN_NAME is not exists." ; exit 1 ; }
+      || { echo "$LUN_NAME does not exist." ; exit 1 ; }
 
   grep -qw "$LUN_NAME" $STAR_DIR/hostlist \
       && { echo "Cannot delete $LUN_NAME, the lun belongs to hosts." ; exit 1 ; }
+
+  grep -qw "$LUN_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+      && { echo "Cannot delete $LUN_NAME, the lun is deactivated." ; exit 1 ; }
 
   NUM_LVS=$(lvs --noheadings | wc -l)
   if [ $NUM_LVS -eq 1 ]
@@ -192,7 +239,9 @@ stardeletelun()
     exit 1
   fi
 
-  lvremove $OPT /dev/$POOL_NAME/$LUN_NAME \
+  confirm_execution "Delete lun ${LUN_NAME}?" $NOP
+
+  lvremove -y /dev/$POOL_NAME/$LUN_NAME \
       || { echo "Failed to delete ${LUN_NAME}." ; exit 1 ; }
 
   grep -vw "$LUN_NAME" $STAR_DIR/lunlist > $STAR_DIR/lunlist.$$
@@ -223,7 +272,17 @@ starupdatetarget()
   then
     is_active_node && echo HD140283 54686520-6f6c-6465-7374-20737461722e > $WORKDIR/lunlist
   fi
-  cat $STAR_DIR/lunlist >> $WORKDIR/lunlist
+  if [ -f $STAR_DIR/luneclipse ]
+  then
+    grep '^LUN' $STAR_DIR/luneclipse > $WORKDIR/luneclipse.LUN
+    grep '^SNAP' $STAR_DIR/luneclipse > $WORKDIR/luneclipse.SNAP
+    grep -vw -f $WORKDIR/luneclipse.LUN $STAR_DIR/lunlist >> $WORKDIR/lunlist
+    grep -vw -f $WORKDIR/luneclipse.SNAP $STAR_DIR/snaplist 2>/dev/null \
+        | awk '{ print $1,$3 }' >> $WORKDIR/lunlist
+  else
+    cat $STAR_DIR/lunlist >> $WORKDIR/lunlist
+    cat $STAR_DIR/snaplist 2>/dev/null >> $WORKDIR/lunlist
+  fi
 
   ##
   ## add objects
@@ -242,7 +301,7 @@ starupdatetarget()
 
     if is_active_node
     then
-      DEV="/dev/STARpool/$LUN_NAME"
+      DEV="/dev/$POOL_NAME/$LUN_NAME"
     else
       DEV="/dev/disk/by-id/scsi-36001405$(echo ${LUN_WWN//-/} | cut -c 1-25)"
          # 001405 is IEEE Company ID of OpenFablics.
@@ -352,6 +411,7 @@ starupdatetarget()
     for LUN_INFO in $(cat $WORKDIR/lunlist)
     do
       LUN_NAME=$(echo $LUN_INFO | awk '{ print $1 }')
+      targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -wq STAR-${LUN_NAME} || continue
       targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns | grep -w STAR-${LUN_NAME} \
           | grep -q 'node._tg_pt_gp' || {
             lunN=$(targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/luns \
@@ -375,6 +435,7 @@ starupdatetarget()
 
     for LUN_NAME in $(echo $HOST_LUNS | sed 's/,/\n/g')
     do
+      grep -qw $LUN_NAME $WORKDIR/lunlist || continue
       targetcli_ls -c /iscsi/$ARRAY_TGT_IQN/tpg1/acls/$HOST_IQN | grep -qw $LUN_NAME \
           && continue
 
@@ -416,8 +477,14 @@ starupdatetarget()
   for LUN_NAME in $(targetcli ls /backstores/block | grep STAR- | grep -v HD140283 \
       | awk '{ print $2 }' | awk -F- '{ print $2 }')
   do
-    if ! grep -wq $LUN_NAME $STAR_DIR/hostlist
+    if [ -f $STAR_DIR/luneclipse ] && grep -wq $LUN_NAME $STAR_DIR/luneclipse
     then
+      echo cd /backstores/block
+      echo delete STAR-$LUN_NAME
+    elif grep -wq $LUN_NAME $STAR_DIR/hostlist
+    then
+      :
+    else
       echo cd /backstores/block
       echo delete STAR-$LUN_NAME
     fi
@@ -430,7 +497,7 @@ starupdatetarget()
   then
     for LUN_NAME in $(cat $WORKDIR/delete_bs_lun_cmds | awk '/STAR-/{ print $2 }')
     do
-      LUN_WWN=$(grep -w ${LUN_NAME/STAR-/} $STAR_DIR/lunlist | awk '{ print $2 }')
+      LUN_WWN=$(grep -w ${LUN_NAME/STAR-/} $WORKDIR/lunlist | awk '{ print $2 }')
       DEV="/dev/disk/by-id/scsi-36001405$(echo ${LUN_WWN//-/} | cut -c 1-25)"
 
       test -L ${DEV} || continue
@@ -478,15 +545,15 @@ starcreatehost()
   check_all_nodes_online
 
   grep -qw "^$HOST_NAME" $STAR_DIR/hostlist \
-      && { echo "$HOST_NAME is already exists." ; exit 1 ; }  
+      && { echo "$HOST_NAME already exists." ; exit 1 ; }  
 
   grep -qw "$HOST_IQN" $STAR_DIR/hostlist \
-      && { echo "$HOST_IQN is already exists." ; exit 1 ; }  
+      && { echo "$HOST_IQN already exists." ; exit 1 ; }  
 
   for LUN_NAME in $(echo $HOST_LUNS | sed 's/,/\n/g')
   do
-    grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
-        || { echo "$LUN_NAME is not exists." ; exit 1 ; }
+    grep -qw "^$LUN_NAME" $STAR_DIR/{lunlist,snaplist} 2>/dev/null \
+        || { echo "$LUN_NAME does not exist." ; exit 1 ; }
   done
 
   echo "$HOST_NAME $HOST_IQN $HOST_LUNS" >> $STAR_DIR/hostlist
@@ -495,7 +562,7 @@ starcreatehost()
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:$STAR_DIR
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
 
   echo "$HOST_NAME created."  
 }
@@ -509,7 +576,7 @@ stardeletehost()
   check_all_nodes_online
 
   grep -qw "^$HOST_NAME" $STAR_DIR/hostlist \
-      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+      || { echo "$HOST_NAME does not exist." ; exit 1 ; }
 
   confirm_execution "Delete host ${HOST_NAME}?" $NOP
 
@@ -520,7 +587,7 @@ stardeletehost()
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
 
   echo "$HOST_NAME deleted."
 }
@@ -534,14 +601,16 @@ starattachlun()
   check_all_nodes_online
 
   grep -qw "^$HOST_NAME" $STAR_DIR/hostlist \
-      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+      || { echo "$HOST_NAME does not exist." ; exit 1 ; }
 
   for LUN_NAME in $(echo $ATTACH_LUNS | sed 's/,/\n/g')
   do
-    grep -qw "$LUN_NAME" $STAR_DIR/lunlist \
-        || { echo "$LUN_NAME is not exists." ; exit 1 ; }
+    grep -qw "^$LUN_NAME" $STAR_DIR/{lunlist,snaplist} 2>/dev/null \
+        || { echo "$LUN_NAME does not exist." ; exit 1 ; }
+    grep -qw "$LUN_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+        && { echo "$LUN_NAME is deactivated." ; exit 1 ; }
     grep -w "^$HOST_NAME" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
-        && { echo "$LUN_NAME is already belongs to ${HOST_NAME}." ; exit 1 ; }
+        && { echo "$LUN_NAME already belongs to ${HOST_NAME}." ; exit 1 ; }
   done
 
   HOST_INFO=$(grep -w ^$HOST_NAME $STAR_DIR/hostlist)
@@ -565,7 +634,7 @@ starattachlun()
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
 
   echo "${ATTACH_LUNS} atached to ${HOST_NAME}." 
 }
@@ -580,12 +649,12 @@ stardetachlun()
   check_all_nodes_online
 
   grep -qw "^$HOST_NAME" $STAR_DIR/hostlist \
-      || { echo "$HOST_NAME is not exists." ; exit 1 ; }
+      || { echo "$HOST_NAME does not exist." ; exit 1 ; }
 
   for LUN_NAME in $(echo $DETACH_LUNS | sed 's/,/\n/g')
   do
     grep -w "^$HOST_NAME" $STAR_DIR/hostlist | grep -qw $LUN_NAME \
-        || { echo "$LUN_NAME is not belongs to ${HOST_NAME}." ; exit 1 ; }
+        || { echo "$LUN_NAME does not belong to ${HOST_NAME}." ; exit 1 ; }
   done
 
   confirm_execution "Detach ${DETACH_LUNS} from ${HOST_NAME}?" $NOP
@@ -609,9 +678,275 @@ stardetachlun()
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
 
   echo "$DETACH_LUNS detached from ${HOST_NAME}."
+}
+
+staractivatelun()
+{
+  ACTIVATE_LUNS=$1
+
+  check_active_node
+  check_all_nodes_online
+
+  for LUN_NAME in $(echo $ACTIVATE_LUNS | sed 's/,/\n/g')
+  do
+    grep -qw "$LUN_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+        || { echo "$LUN_NAME is not deactivated." ; exit 1 ; }
+  done
+
+  echo "Luns or snaps will be accessible from Hosts (internally reattach)."
+
+  for LUN_NAME in $(echo $ACTIVATE_LUNS | sed 's/,/\n/g')
+  do
+    grep -wv $LUN_NAME $STAR_DIR/luneclipse > $STAR_DIR/luneclipse.$$
+    mv $STAR_DIR/luneclipse.$$ $STAR_DIR/luneclipse
+  done
+
+  starupdatetarget
+
+  scp $STAR_DIR/luneclipse ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
+
+  echo "$ACTIVATE_LUNS are activated."
+}
+
+stardeactivatelun()
+{
+  DEACTIVATE_LUNS=$1
+  NOP=$2
+
+  check_active_node
+  check_all_nodes_online
+
+  for LUN_NAME in $(echo $DEACTIVATE_LUNS | sed 's/,/\n/g')
+  do
+    grep -qw "^$LUN_NAME" $STAR_DIR/{lunlist,snaplist} 2>/dev/null \
+        || { echo "$LUN_NAME does not exist." ; exit 1 ; }
+    grep -qw "$LUN_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+        && { echo "$LUN_NAME is already deactivated." ; exit 1 ; }
+
+    echo "$LUN_NAME belongs to hosts below."
+    grep -w "$LUN_NAME" $STAR_DIR/hostlist | awk '{ print "  " $1 }'
+  done
+
+  echo
+  echo "Luns or snaps will be inaccessible from Hosts (internally detach)."
+  echo "Deactivated luns or snaps cannot attach to hosts."
+  confirm_execution "Deactivate ${DEACTIVATE_LUNS}?" $NOP
+
+  for LUN_NAME in $(echo $DEACTIVATE_LUNS | sed 's/,/\n/g')
+  do
+    echo $LUN_NAME
+  done >> $STAR_DIR/luneclipse
+
+  starupdatetarget
+
+  scp $STAR_DIR/luneclipse ${PARTNER_NODE}:${STAR_DIR}
+  ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
+
+  echo "$DEACTIVATE_LUNS are deactivated."
+}
+
+starcreatesnap()
+{
+  SNAP_NAME=$1
+  SOURCE_LUN_NAME=$2
+  SNAP_SIZE=$3
+
+  check_active_node
+  check_all_nodes_online
+
+  grep -qw "$SOURCE_LUN_NAME" $STAR_DIR/lunlist \
+      || { echo "Source lun $SOURCE_LUN_NAME does not exist." ; exit 1 ; }
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
+      && { echo "$SNAP_NAME already exists." ; exit 1 ; }
+
+  echo "$SNAP_NAME" | grep -qE '^SNAP[0-9]+$' \
+      || { echo "snap_name must be match pettern '^SNAP[0-9]+'." ; exit 1 ; }
+
+  echo "$SNAP_SIZE" | grep -qE -e '^[0-9]+M$' -e '^[1-9][0-9]*%ORIGIN$' \
+      || { echo "snap_size must be in megabytes, like '1024M'." ;
+           echo "  or percentage(of source lun size)%ORIGIN format, like '10%ORIGIN'." ;
+	   exit 1 ; }
+
+  SNAP_WWN=$(uuidgen)
+
+  if echo "$SNAP_SIZE" | grep -qE '^[0-9]+M$'
+  then
+    OPT="-L"
+  else
+    OPT="-l"
+  fi
+
+  lvcreate -n $SNAP_NAME $OPT $SNAP_SIZE --snapshot /dev/$POOL_NAME/$SOURCE_LUN_NAME \
+      || { echo "Failed to create ${SNAP_NAME}." ; exit 1 ; }
+
+  echo "$SNAP_NAME $SOURCE_LUN_NAME $SNAP_WWN $SNAP_SIZE" >> $STAR_DIR/snaplist
+  
+  scp $STAR_DIR/snaplist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "$SNAP_NAME $SOURCE_LUN_NAME $SNAP_WWN $SNAP_SIZE"
+}
+
+starrecreatesnap()
+{
+  SNAP_NAME=$1
+  NOP=$2
+
+  check_active_node
+  check_all_nodes_online
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
+      || { echo "$SNAP_NAME does not exist." ; exit 1 ; }
+
+  IS_DEACTIVATED=0
+  grep -qw "$SNAP_NAME" $STAR_DIR/luneclipse 2>/dev/null && IS_DEACTIVATED=1
+
+  confirm_execution "Recreate $SNAP_NAME?" $NOP
+
+  if [ $IS_DEACTIVATED -eq 0 ]
+  then
+    stardeactivatelun $SNAP_NAME -nop
+  fi
+
+  SNAP_INFO=$(grep -w "^$SNAP_NAME" $STAR_DIR/snaplist)
+  SOURCE_LUN_NAME=$(echo $SNAP_INFO | awk '{ print $2 }')
+  SNAP_WWN=$(echo $SNAP_INFO | awk '{ print $3 }')
+  SNAP_SIZE=$(echo $SNAP_INFO | awk '{ print $4 }')
+
+  if echo "$SNAP_SIZE" | grep -qE '^[0-9]+M$'
+  then
+    OPT="-L"
+  else
+    OPT="-l"
+  fi
+
+  lvremove -y /dev/$POOL_NAME/$SNAP_NAME \
+      || { echo "Failed to delete ${SNAP_NAME}." ; exit 1 ; }
+
+  lvcreate -n $SNAP_NAME $OPT $SNAP_SIZE --snapshot /dev/$POOL_NAME/$SOURCE_LUN_NAME
+
+  if [ $IS_DEACTIVATED -eq 0 ]
+  then
+    staractivatelun $SNAP_NAME
+  fi
+
+  echo "$SNAP_NAME recreated."
+}
+
+starextendsnap()
+{
+  SNAP_NAME=$1
+  NEW_SNAP_SIZE=$2
+  NOP=$3
+
+  check_active_node
+  check_all_nodes_online
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
+      || { echo "$SNAP_NAME does not exist." ; exit 1 ; }
+
+  SNAP_INFO=$(grep -w "^$SNAP_NAME" $STAR_DIR/snaplist)
+  SOURCE_LUN_NAME=$(echo $SNAP_INFO | awk '{ print $2 }')
+  SNAP_WWN=$(echo $SNAP_INFO | awk '{ print $3 }')
+  SNAP_SIZE=$(echo $SNAP_INFO | awk '{ print $4 }')
+
+  confirm_execution \
+      "Extend $SNAP_NAME size from $SNAP_SIZE to $NEW_SNAP_SIZE?" $NOP
+
+  if echo "$SNAP_SIZE" | grep -qE '^[0-9]+M$'
+  then
+    OPT="-L"
+  else
+    OPT="-l"
+  fi
+
+  lvextend $OPT $NEW_SNAP_SIZE /dev/$POOL_NAME/$SNAP_NAME \
+      || { echo "Failed to extend ${SNAP_NAME}." ; exit 1 ; }
+
+  sed -i -E \
+      's/^('"$SNAP_NAME"') +.+/\1 '"$SOURCE_LUN_NAME $SNAP_WWN $NEW_SNAP_SIZE"'/g' \
+          $STAR_DIR/snaplist
+
+  echo "$SNAP_NAME extended."
+}
+
+starrestoresnap()
+{
+  SNAP_NAME=$1
+  NOP=$2
+
+  check_active_node
+  check_all_nodes_online
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
+      || { echo "$SNAP_NAME does not exist." ; exit 1 ; }
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/hostlist \
+      && { echo "Cannot restore $SNAP_NAME, the snap belongs to hosts." ; exit 1 ; }
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+      && { echo "Cannot restore $SNAP_NAME, the snap is deactivated." ; exit 1 ; }
+
+  SNAP_INFO=$(grep -w "^$SNAP_NAME" $STAR_DIR/snaplist)
+  SOURCE_LUN_NAME=$(echo $SNAP_INFO | awk '{ print $2 }')
+
+  grep -qw "$SOURCE_LUN_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+      || { echo "Cannot restore to $SOURCE_LUN_NAME, deactivate target lun first." ;
+           exit 1 ; }
+
+  confirm_execution "Restore $SNAP_NAME to ${SOURCE_LUN_NAME}?" $NOP
+
+  lvchange -an /dev/$POOL_NAME/$SOURCE_LUN_NAME \
+      || { echo "Failed to restore ${SNAP_NAME}. lvchange -an failed." ; exit 1 ; }
+
+  lvconvert --merge /dev/$POOL_NAME/$SNAP_NAME \
+      || { echo "Failed to restore ${SNAP_NAME}." ; exit 1 ; }
+
+  lvchange -ay /dev/$POOL_NAME/$SOURCE_LUN_NAME \
+      || { echo "Failed to restore ${SNAP_NAME}. lvchange -ay failed." ; exit 1 ; }
+
+  grep -vw "$SNAP_NAME" $STAR_DIR/snaplist > $STAR_DIR/snaplist.$$
+  mv $STAR_DIR/snaplist.$$ $STAR_DIR/snaplist
+
+  scp $STAR_DIR/snaplist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "$SNAP_NAME restored to $SOURCE_LUN_NAME."
+}
+
+stardeletesnap()
+{
+  SNAP_NAME=$1
+  NOP=$2
+
+  check_active_node
+  check_all_nodes_online
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
+      || { echo "$SNAP_NAME does not exist." ; exit 1 ; }
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/hostlist \
+      && { echo "Cannot delete $SNAP_NAME, the snap belongs to hosts." ; exit 1 ; }
+
+  grep -qw "$SNAP_NAME" $STAR_DIR/luneclipse 2>/dev/null \
+      && { echo "Cannot delete $SNAP_NAME, the snap is deactivated." ; exit 1 ; }
+
+  confirm_execution "Delete snap ${SNAP_NAME}?" $NOP
+
+  lvremove -y /dev/$POOL_NAME/$SNAP_NAME \
+      || { echo "Failed to delete ${SNAP_NAME}." ; exit 1 ; }
+
+  grep -vw "$SNAP_NAME" $STAR_DIR/snaplist > $STAR_DIR/snaplist.$$
+  mv $STAR_DIR/snaplist.$$ $STAR_DIR/snaplist
+
+  scp $STAR_DIR/snaplist ${PARTNER_NODE}:${STAR_DIR}
+
+  echo "$SNAP_NAME deleted."
 }
 
 stargetactive()
@@ -664,23 +999,53 @@ bigbang()
 
   scp $STAR_DIR/hostlist ${PARTNER_NODE}:${STAR_DIR}
   ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-      "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/starupdatetarget"
+      "$EXP_CMDLINE_FOR_SSH /usr/bin/starupdatetarget"
 
-  lvremove -y /dev/STARpool/LUN*
+  lvremove -y /dev/$POOL_NAME/LUN*
   : > $STAR_DIR/lunlist
   scp $STAR_DIR/lunlist ${PARTNER_NODE}:${STAR_DIR}
 
   echo "Hosts and luns are deleted."
 }
 
+starlistlun()
+{
+  (
+    IFS=$'\n'
+    for LUN_INFO in $(cat $STAR_DIR/lunlist)
+    do
+      LUN_NAME="${LUN_INFO%% *}"
+      DEACTIVATED=""
+      grep -qw $LUN_NAME $STAR_DIR/luneclipse 2>/dev/null && DEACTIVATED="Diactivated"
+      echo $LUN_INFO $DEACTIVATED
+    done
+  )
+}
+
+starlistsnap()
+{
+  (
+    IFS=$'\n'
+    for SNAP_INFO in $(cat $STAR_DIR/snaplist 2>/dev/null)
+    do
+      SNAP_NAME="${SNAP_INFO%% *}"
+      DEACTIVATED=""
+      grep -qw $SNAP_NAME $STAR_DIR/luneclipse 2>/dev/null && DEACTIVATED="Diactivated"
+      echo $SNAP_INFO $DEACTIVATED
+    done
+  )
+}
+
 COMMAND_NAME=$(basename $0)
 
 case $COMMAND_NAME in
-  starlistlun)
-    cat $STAR_DIR/lunlist
-    ;;
   starlisthost)
     cat $STAR_DIR/hostlist
+    ;;
+  starshowlun)
+    check_active_node
+    lvdisplay \
+        $(echo $1 | awk -F, '{ for(i=1;i<=NF;i++)printf("/dev/'$POOL_NAME'/%s ",$i) }')
     ;;
   starshowpool)
     check_active_node
@@ -711,7 +1076,7 @@ case $COMMAND_NAME in
     check_all_nodes_online
     confirm_execution "Shutdown array ${ARRAY_NAME}?" $1
     ssh -n -o ConnectTimeout=10 $PARTNER_NODE \
-        "export STARCLI_DEBUG=${STARCLI_DEBUG:-0} ; /usr/bin/galaxyshutdownnode -nop"
+        "$EXP_CMDLINE_FOR_SSH /usr/bin/galaxyshutdownnode -nop"
     sleep 30
     galaxyshutdownnode -nop
     ;;
