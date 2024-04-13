@@ -854,6 +854,11 @@ starextendsnap()
   grep -qw "$SNAP_NAME" $STAR_DIR/snaplist 2>/dev/null \
       || { echo "$SNAP_NAME does not exist." ; exit 1 ; }
 
+  echo "$NEW_SNAP_ALLOC_SIZE" | grep -qE -e '^[0-9]+M$' -e '^[1-9][0-9]*%ORIGIN$' \
+      || { echo "snap_alloc_size must be in megabytes, like '1024M'." ;
+           echo "  or percentage(of source lun size)%ORIGIN format, like '10%ORIGIN'." ;
+           exit 1 ; }
+
   SNAP_INFO=$(grep -w "^$SNAP_NAME" $STAR_DIR/snaplist)
   SOURCE_LUN_NAME=$(echo $SNAP_INFO | awk '{ print $2 }')
   SNAP_WWN=$(echo $SNAP_INFO | awk '{ print $3 }')
